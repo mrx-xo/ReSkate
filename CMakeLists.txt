@@ -381,6 +381,16 @@ if(DINGOSDK_BUILD_TRAINER_TESTS)
     add_executable(dingosdk_trainer_landing_tests Extension/Trainer/Test/landing_tests.cpp)
     target_include_directories(dingosdk_trainer_landing_tests PRIVATE "${PROJECT_SOURCE_DIR}")
     add_test(NAME trainer_landing COMMAND dingosdk_trainer_landing_tests)
+    if(WIN32)
+        # Actual gravity updates over constructed native objects, including retired map records.
+        # Unrelated services in client_noclip.cpp are fail-fast stand-ins, as in owned_body_source_tests.
+        add_executable(dingosdk_air_gravity_source_tests Extension/Skater/Test/air_gravity_source_tests.cpp)
+        target_include_directories(dingosdk_air_gravity_source_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+        target_compile_options(dingosdk_air_gravity_source_tests PRIVATE /Gy /Gw)
+        target_link_options(dingosdk_air_gravity_source_tests PRIVATE /OPT:REF)
+        add_test(NAME trainer_air_gravity COMMAND dingosdk_air_gravity_source_tests)
+        set_tests_properties(trainer_air_gravity PROPERTIES TIMEOUT 15)
+    endif()
     # Built-in presets: Hardcore goes at least as far as Realistic, class names are spelt right, and
     # the player's own presets never keep a built-in's name.
     add_executable(dingosdk_trainer_presets_tests Extension/Trainer/Test/presets_tests.cpp Extension/Trainer/trainer_presets.cpp)

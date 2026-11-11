@@ -654,31 +654,51 @@ void trainer_air_gravity(std::uintptr_t core) noexcept {
     try {
         const auto bodies = debug_noclip_bodies(state.trial.base, g.client.load(std::memory_order_relaxed), g.entity.load(std::memory_order_relaxed));
         if (bodies.core != core || !bodies.context) return;
-        bool found = false;
-        for (const auto& slot : g.records) {
-            const auto record = slot.load(std::memory_order_relaxed);
+        // Searches start before a flight exists. A retired flight record or an unavailable
+        // animation output must not leave the new map's planner at the game's gravity.
+        try {
+            if (landing != 1 || g.searches) air_gravity_searches(g, state.trial.base, game_gravity * landing);
+        } catch (const SourceGuard&) {} // A planner being replaced must not block the flight either.
+        std::uintptr_t found{}, restore_pending{};
+        for (auto& slot : g.records) {
+            auto record = slot.load(std::memory_order_relaxed);
             if (!record) continue;
-            SourceReader reader;
-            const auto context = reader.pointer(record, trajectory_context);
-            const auto now = reader.value<std::array<float, 3>>(record, flight_record_gravity);
-            reader.verify();
-            // Only a record that reads as a gravity is written: straight down, and the game's or one of the trainer's.
-            if (context != bodies.context || now[0] != 0 || now[2] != 0 || !(now[1] < -0.1f) || !(now[1] > -250.0f)) continue;
-            const float wanted = game_gravity * factor;
-            if (now[1] != wanted) body_write(record + flight_record_gravity + 4, wanted);
-            g.held = factor == 1 ? 0 : record;
-            if (factor != 1) g.steps.fetch_add(1, std::memory_order_relaxed);
-            if (factor != 1 && timing > 0) air_gravity_animation(g, core, record, factor, landing, timing);
-            else g.animation_rate.store(1.0f, std::memory_order_relaxed);
-            found = true;
-            break;
+            try {
+                SourceReader reader;
+                const auto context = reader.pointer(record, trajectory_context);
+                const auto now = reader.value<std::array<float, 3>>(record, flight_record_gravity);
+                reader.verify();
+                // Only a record that reads as a gravity is written: straight down, and the game's or one of the trainer's.
+                if (context != bodies.context || now[0] != 0 || now[2] != 0 || !(now[1] < -0.1f) || !(now[1] > -250.0f)) continue;
+                const float wanted = game_gravity * factor;
+                if (now[1] != wanted) body_write(record + flight_record_gravity + 4, wanted);
+                found = record;
+                break;
+            } catch (const SourceGuard&) {
+                // A changed observation or failed write can be temporary. Retire only an
+                // inaccessible record, without erasing a newer launch in the same slot.
+                std::uintptr_t context{};
+                std::array<float, 3> gravity{};
+                const bool readable = source_range(record, trajectory_context + sizeof(context)) &&
+                    memory::peek(record + trajectory_context, context) &&
+                    memory::peek(record + flight_record_gravity, gravity);
+                if (!readable) slot.compare_exchange_strong(record, 0, std::memory_order_relaxed);
+                else if (factor == 1 && g.held == record) restore_pending = record;
+            }
         }
-        if (!found) {
-            g.held = 0;
+        // Keep an expired override alive until its still-readable flight can be restored.
+        g.held = restore_pending ? restore_pending : factor == 1 ? 0 : found;
+        if (found && factor != 1) g.steps.fetch_add(1, std::memory_order_relaxed);
+        if (found && factor != 1 && timing > 0) {
+            try {
+                air_gravity_animation(g, core, found, factor, landing, timing);
+            } catch (const SourceGuard&) {
+                g.animation_rate.store(1.0f, std::memory_order_relaxed);
+                g.countdown = -1; // Recompute the rate when the new animation output becomes readable.
+            }
+        } else {
             g.animation_rate.store(1.0f, std::memory_order_relaxed);
         }
-        // The searches plan with the landing gravity while one is set, in the air or not (a search starts at the launch).
-        if (landing != 1 || g.searches) air_gravity_searches(g, state.trial.base, game_gravity * landing);
     } catch (...) {}
 }
 // ---- revert boost ------------------------------------------------------------------------------
