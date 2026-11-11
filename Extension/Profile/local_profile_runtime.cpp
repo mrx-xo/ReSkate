@@ -344,6 +344,7 @@ void update_local_customization() noexcept {
     catch (...) { dingosdk::logging::event(dingosdk::logging::Channel::profile, "{\"event\":\"local_object_categories_failed\",\"operation\":\"update\"}"); }
     update_music_catalog();
     try { update_music_catalog_refresh(); } catch (...) {}
+    try { update_music_preference(); } catch (...) {}
     try { update_spotify_cover(); } catch (...) {}
     update_music_shelf();
     try {
@@ -360,6 +361,7 @@ void local_profile_before_level_transition(unsigned next) noexcept {
     if (!s.active.load(std::memory_order_acquire)) return;
     std::lock_guard lock(s.native_mutex);
     music_shelf_before_level_transition(next);
+    music_preference_before_level_transition(next);
     item_browser::before_level_transition(next, s.base);
     news_runtime().pending.before_transition(next);
     object_runtime().pending.before_transition(next);

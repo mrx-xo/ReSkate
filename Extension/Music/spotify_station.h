@@ -100,6 +100,10 @@ struct GameSong {
 };
 std::optional<GameSong> game_song() noexcept;
 bool game_next() noexcept;
+// A channel learned from a deliberate playlist choice stays the player even when a world
+// speaker binds later. The checked next operation cannot advance a different channel.
+void follow_game_channel(std::uint32_t channel) noexcept;
+bool game_next_on(std::uint32_t channel) noexcept;
 // The player's channel's queue, as the game chose a song for it (local_music_playback.cpp).
 void plain_song_chosen(std::uintptr_t queue, std::uint32_t channel, bool asked) noexcept;
 std::uint32_t plain() noexcept;

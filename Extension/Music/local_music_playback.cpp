@@ -3,6 +3,8 @@
 #include "Extension/Music/spotify_rows.h"
 
 #include "local_music_playback_policy.h"
+#include "local_music_binding.h"
+#include "local_music_assets.h"
 #include "Engine/Core/Hooks/hooks.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <mutex>
 
 namespace dingosdk::profile_runtime {
 namespace {
@@ -29,6 +32,14 @@ using music_playback::CursorPlan;
 std::atomic<std::uintptr_t> image_base{};
 std::atomic<bool> shuffle_enabled{};
 std::atomic<bool> playback_available{};
+std::mutex preference_mutex;
+music_preference::State preference_state;
+// channel + 1, so channel zero can also wait. Set only when native playback tried to select.
+std::atomic<std::uint32_t> preference_waiting{};
+std::atomic<std::uint64_t> preference_next_poll{};
+struct PendingNativeChoice { std::uint32_t channel{}, playlist{}; std::uint64_t generation{}; };
+std::optional<PendingNativeChoice> pending_native_choice;
+std::uint64_t preference_generation{}; // Protected by preference_mutex.
 MusicSelectNext select_next{};
 MusicChannelPlaylistBind bind_channel_playlist{};
 std::array<std::atomic<std::uint64_t>, 256> last_logged_channel_bindings{};
@@ -195,6 +206,90 @@ bool favorites_node_ready(std::uintptr_t manager, std::uint32_t favorites_playli
     std::uintptr_t members{};
     std::uint32_t count{};
     return node && member_count(node, members, count);
+}
+
+// Called with the native manager locked. No profile/model locks are taken by audio hooks.
+bool preferred_playlist(std::uintptr_t manager, std::uint32_t channel, bool& wanted,
+                        std::uint32_t& playlist) {
+    music_preference::Members members;
+    bool favorites{};
+    {
+        std::lock_guard lock(preference_mutex);
+        wanted = preference_state.wants(channel);
+        if (!wanted) return false;
+        favorites = preference_state.preference->id == music_preference::favorites_id;
+        if (!favorites) members = preference_state.members();
+    }
+    if (favorites) {
+        std::uintptr_t ui{};
+        return read_at(image_base.load(std::memory_order_acquire) + local_music::ui_manager, ui) && ui &&
+            read_at(ui + local_music::ui_favorites_playlist, playlist) && favorites_node_ready(manager, playlist);
+    }
+    if (members.empty()) return false;
+    const auto reader = [](std::uintptr_t address, auto& value) { return read_at(address, value); };
+    // A current binding with the right members need not be replaced by an older equivalent node.
+    music_preference::Members current;
+    if (find_channel_node(manager, channel, playlist) &&
+        music_preference::read_members(reader, find_playlist_node(manager, playlist), current) && current == members)
+        return true;
+    const auto resolved = music_preference::find_playlist(reader, manager, members);
+    if (!resolved) return false;
+    playlist = *resolved;
+    return true;
+}
+
+bool ensure_preferred_binding(std::uint32_t channel) {
+    {
+        std::lock_guard lock(preference_mutex);
+        if (!preference_state.wants(channel)) return true;
+    }
+    const auto base = image_base.load(std::memory_order_acquire);
+    std::uintptr_t manager{};
+    if (!base || !bind_channel_playlist || !read_at(base + local_music::asset_manager, manager) ||
+        !valid_range(manager, 0xd8)) return false;
+    CriticalSectionGuard manager_lock(manager + local_music::manager_lock);
+    std::uintptr_t current_manager{};
+    if (!read_at(base + local_music::asset_manager, current_manager) || current_manager != manager) return false;
+    bool wanted{};
+    std::uint32_t playlist{}, current{};
+    if (!preferred_playlist(manager, channel, wanted, playlist)) return !wanted;
+    if (find_channel_node(manager, channel, current) && current == playlist) return true;
+    bind_channel_playlist(reinterpret_cast<std::uintptr_t>(&channel), reinterpret_cast<std::uintptr_t>(&playlist));
+    return find_channel_node(manager, channel, current) && current == playlist;
+}
+
+void remember_playlist(std::uint32_t channel, std::uint32_t playlist, bool favorites, bool external) {
+    if (channel >= 256) return;
+    const auto base = image_base.load(std::memory_order_acquire);
+    std::uintptr_t manager{};
+    if (!base || !read_at(base + local_music::asset_manager, manager) || !valid_range(manager, 0xd8)) return;
+    CriticalSectionGuard manager_lock(manager + local_music::manager_lock);
+    std::uintptr_t current_manager{};
+    std::uint32_t applied{};
+    if (!read_at(base + local_music::asset_manager, current_manager) || current_manager != manager ||
+        !find_channel_node(manager, channel, applied) || applied != playlist) return;
+    music_preference::Members members;
+    const auto reader = [](std::uintptr_t address, auto& value) { return read_at(address, value); };
+    (void)music_preference::read_members(reader, find_playlist_node(manager, playlist), members);
+    std::uintptr_t ui{};
+    std::uint32_t favorite_playlist{};
+    if (read_at(base + local_music::ui_manager, ui) && ui &&
+        read_at(ui + local_music::ui_favorites_playlist, favorite_playlist) && favorite_playlist == playlist)
+        favorites = true;
+    spotify_station::follow_game_channel(channel);
+    std::lock_guard lock(preference_mutex);
+    pending_native_choice.reset();
+    if (!favorites && !external && members.empty())
+        pending_native_choice = PendingNativeChoice{channel, playlist, preference_generation};
+    preference_state.select(channel, std::move(members), true, true, favorites, external);
+    preference_waiting.store(0, std::memory_order_release);
+}
+
+void preference_song_selected(std::uint32_t channel, std::int32_t chosen) {
+    if (chosen < 0 || channel >= 256) return;
+    std::lock_guard lock(preference_mutex);
+    auto expected = channel + 1;
+    preference_waiting.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
 }
 
 bool current_guid(std::uintptr_t queue, std::uintptr_t playlist_asset,
@@ -478,7 +573,89 @@ bool initialize_music_playback(std::uintptr_t base, bool shuffle) noexcept {
     for (auto& known : music_channels) known.store(false, std::memory_order_relaxed);
     logged_policy_events.store(0, std::memory_order_relaxed);
     playback_available.store(false, std::memory_order_release);
+    try {
+        std::lock_guard lock(preference_mutex);
+        preference_state = {};
+        if (const auto& store = local_runtime().store) preference_state.preference = music_preference::load(*store);
+        if (preference_state.preference) spotify_station::follow_game_channel(preference_state.preference->channel);
+        preference_waiting.store(0, std::memory_order_release);
+        preference_next_poll = 0;
+    } catch (...) {}
     return true;
+}
+
+void publish_music_preferences(std::vector<music_preference::Playlist> playlists) {
+    std::lock_guard lock(preference_mutex);
+    preference_state.publish(std::move(playlists));
+}
+
+void music_preference_before_level_transition(unsigned next) noexcept {
+    if (next != 3 && next != 11) return;
+    try {
+        std::lock_guard lock(preference_mutex);
+        preference_state.before_transition();
+        if (preference_state.pending && preference_state.pending->members.empty()) preference_state.pending.reset();
+        pending_native_choice.reset();
+        ++preference_generation;
+        preference_waiting.store(0, std::memory_order_release);
+        preference_next_poll = 0;
+    } catch (...) {}
+}
+
+void update_music_preference() {
+    if (!music_playback_available()) return;
+    const auto now = GetTickCount64();
+    if (now < preference_next_poll.load(std::memory_order_relaxed)) return;
+    preference_next_poll.store(now + 500, std::memory_order_relaxed);
+    bool refresh{}, dirty{};
+    std::optional<music_preference::Choice> choice;
+    std::optional<PendingNativeChoice> pending;
+    {
+        std::lock_guard lock(preference_mutex);
+        refresh = preference_state.needs_catalog(preference_waiting.load(std::memory_order_acquire) != 0);
+        choice = preference_state.preference;
+        dirty = preference_state.dirty;
+        pending = pending_native_choice;
+    }
+    if (dirty && local_runtime().store) {
+        music_preference::save(*local_runtime().store, choice);
+        std::lock_guard lock(preference_mutex);
+        if (preference_state.preference == choice) preference_state.dirty = false;
+        logging::event(logging::Channel::music, Json{{"event", "music_playlist_preference_saved"},
+            {"playlist", choice ? choice->id : ""}, {"channel", choice ? choice->channel : 0u}}.dump().c_str());
+    }
+    if (refresh) { MusicCatalog catalog; (void)read_music_catalog(catalog); }
+    if (pending) {
+        const auto base = image_base.load(std::memory_order_acquire);
+        std::uintptr_t manager{};
+        if (base && read_at(base + local_music::asset_manager, manager) && valid_range(manager, 0xd8)) {
+            CriticalSectionGuard manager_lock(manager + local_music::manager_lock);
+            std::uintptr_t current_manager{};
+            std::uint32_t bound{};
+            music_preference::Members members;
+            const auto reader = [](std::uintptr_t address, auto& value) { return read_at(address, value); };
+            if (read_at(base + local_music::asset_manager, current_manager) && current_manager == manager &&
+                find_channel_node(manager, pending->channel, bound) && bound == pending->playlist &&
+                music_preference::read_members(reader, find_playlist_node(manager, bound), members)) {
+                std::lock_guard lock(preference_mutex);
+                if (pending_native_choice && preference_generation == pending->generation &&
+                    pending_native_choice->channel == pending->channel && pending_native_choice->playlist == bound) {
+                    preference_state.select(pending->channel, std::move(members), true, true);
+                    pending_native_choice.reset();
+                }
+            }
+        }
+    }
+    if (const auto waiting = preference_waiting.load(std::memory_order_acquire); waiting &&
+        !spotify_station::active() && spotify_station::plain() == waiting - 1 && ensure_preferred_binding(waiting - 1)) {
+        // This queue already attempted playback and was held for its saved playlist. The
+        // existing client-thread next operation checks the currently observed queue's vtable.
+        std::lock_guard lock(preference_mutex);
+        if (preference_waiting.load(std::memory_order_acquire) == waiting && spotify_station::game_next_on(waiting - 1)) {
+            auto expected = waiting;
+            preference_waiting.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+        }
+    }
 }
 
 void activate_music_playback() noexcept { playback_available.store(true, std::memory_order_release); }
@@ -529,6 +706,19 @@ std::int32_t __fastcall music_select_next_hook(std::uintptr_t queue, std::uintpt
         std::uint32_t channel{};
         if (const auto base = image_base.load(std::memory_order_acquire); base && native_queue_channel(base, queue, channel))
             spotify_station::plain_song_chosen(queue, channel, asked != 0);
+    }
+    if (music_playback_available() && !spotify_station::active()) {
+        std::uint32_t type{}, channel{};
+        const auto base = image_base.load(std::memory_order_acquire);
+        if (read_at(playlist_asset + local_music::playlist_asset_type, type) && type == 4 &&
+            base && native_queue_channel(base, queue, channel) && channel < music_channels.size()) {
+            try {
+                if (!ensure_preferred_binding(channel)) {
+                    preference_waiting.store(channel + 1, std::memory_order_release);
+                    return -1;
+                }
+            } catch (...) { return -1; }
+        }
     }
     if (std::uint8_t asked{}; spotify_station::active() && dingosdk::memory::peek(queue + 0xf1, asked)) {
         std::uint32_t channel{};
@@ -585,6 +775,9 @@ std::int32_t __fastcall music_select_next_hook(std::uintptr_t queue, std::uintpt
         // (Of the station's own queue alone: another channel's choices are not its.)
         std::uint32_t queue_channel{~0u};
         const bool stations_queue = native_queue_channel(image_base.load(std::memory_order_acquire), queue, queue_channel) && queue_channel == spotify_station::channel();
+        // Native playback may recover on its own before the profile tick retries it. Do not
+        // leave a pending Next which would immediately skip the song it just selected.
+        if (!spotify_station::active()) preference_song_selected(queue_channel, chosen);
         if (const int station = spotify_station::current(); station >= 0 && !stations_queue) {
         } else if (station >= 0) {
             if (last_station.exchange(station, std::memory_order_relaxed) != station) last_chosen.store(-1, std::memory_order_relaxed);
@@ -624,6 +817,14 @@ std::uintptr_t __fastcall music_channel_playlist_bind_hook(std::uintptr_t channe
         read_at(playlist_id_pointer, requested_playlist_id);
     auto playlist_id = requested_playlist_id;
     bool favorites_remapped{};
+    bool from_screen{};
+    if (have_binding && spotify_station::music_screen()) {
+        void* frames[16]{};
+        const auto count = CaptureStackBackTrace(0, 16, frames, nullptr);
+        const auto base = image_base.load(std::memory_order_acquire);
+        for (unsigned i = 0; i < count; ++i)
+            from_screen |= reinterpret_cast<std::uintptr_t>(frames[i]) == base + local_music::music_screen_return;
+    }
     // Zero is Favorites only where the music player asks: a channel it has selected songs for.
     const bool music_channel = have_binding && channel < music_channels.size() &&
         music_channels[channel].load(std::memory_order_relaxed);
@@ -644,6 +845,22 @@ std::uintptr_t __fastcall music_channel_playlist_bind_hook(std::uintptr_t channe
         playlist_id = music_playback::resolve_playlist_binding_id(
             requested_playlist_id, favorites_playlist, node_ready);
         favorites_remapped = playlist_id != requested_playlist_id;
+    }
+
+    if (have_binding && !from_screen && !spotify_station::active() && music_playback_available()) {
+        try {
+            const auto base = image_base.load(std::memory_order_acquire);
+            std::uintptr_t manager{};
+            if (base && read_at(base + local_music::asset_manager, manager) && valid_range(manager, 0xd8)) {
+                CriticalSectionGuard manager_lock(manager + local_music::manager_lock);
+                bool wanted{};
+                std::uint32_t preferred{};
+                if (preferred_playlist(manager, channel, wanted, preferred)) {
+                    playlist_id = preferred;
+                    favorites_remapped = playlist_id != requested_playlist_id;
+                }
+            }
+        } catch (...) {}
     }
 
     // A Spotify station is a playlist whose only member is the song it was given
@@ -700,12 +917,7 @@ std::uintptr_t __fastcall music_channel_playlist_bind_hook(std::uintptr_t channe
     // (the return address below is in every such binding traced, and in none the world made);
     // anything else that takes the player's channel off its station is the world's doing.
     if (have_binding && station < 0 && playlist_id != 0 && channel < bound_playlist.size() && spotify_station::active() && channel == spotify_station::channel()) {
-        constexpr std::uintptr_t music_screen_return = addr::local_music::music_screen_return;
-        void* frames[16]{};
-        const auto count = CaptureStackBackTrace(0, 16, frames, nullptr);
         const auto image = image_base.load(std::memory_order_acquire);
-        bool from_screen{};
-        for (unsigned i = 0; i < count; ++i) from_screen = from_screen || reinterpret_cast<std::uintptr_t>(frames[i]) == image + music_screen_return;
         if (auto own = bound_playlist[channel].load(std::memory_order_relaxed); !from_screen && own && image) {
             spotify_station::grabbed();
             try {
@@ -715,8 +927,28 @@ std::uintptr_t __fastcall music_channel_playlist_bind_hook(std::uintptr_t channe
             return bind_channel_playlist(channel_pointer, reinterpret_cast<std::uintptr_t>(&own));
         }
     }
-    const auto result = favorites_remapped ? bind_channel_playlist(channel_pointer, reinterpret_cast<std::uintptr_t>(&playlist_id))
-        : bind_channel_playlist(channel_pointer, playlist_id_pointer);
+    const auto apply_binding = [&] {
+        return bind_channel_playlist(channel_pointer, favorites_remapped
+            ? reinterpret_cast<std::uintptr_t>(&playlist_id) : playlist_id_pointer);
+    };
+    const auto result = [&] {
+        if (have_binding && from_screen && music_playback_available()) {
+            const auto base = image_base.load(std::memory_order_acquire);
+            std::uintptr_t manager{};
+            if (base && read_at(base + local_music::asset_manager, manager) && valid_range(manager, 0xd8)) {
+                CriticalSectionGuard manager_lock(manager + local_music::manager_lock);
+                // The native binder updates the channel map. Capture the user's new choice
+                // under the same lock so a selector cannot restore the previous preference
+                // between applying it and verifying it. The manager lock is recursive.
+                const auto applied = apply_binding();
+                try { remember_playlist(channel, playlist_id, requested_playlist_id == 0 ||
+                        (favorites_playlist && playlist_id == favorites_playlist), station >= 0); }
+                catch (...) {}
+                return applied;
+            }
+        }
+        return apply_binding();
+    }();
     if (have_binding && channel < bound_playlist.size()) bound_playlist[channel].store(playlist_id, std::memory_order_relaxed);
     if (have_binding && channel < channel_bound_at.size()) channel_bound_at[channel].store(GetTickCount64(), std::memory_order_relaxed);
     if (static std::atomic<int> said{}; have_binding && dingosdk::logging::enabled(dingosdk::logging::Level::debug) && said.fetch_add(1, std::memory_order_relaxed) < 600) {

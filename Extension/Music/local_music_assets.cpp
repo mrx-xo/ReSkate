@@ -8,6 +8,7 @@
 #include <cstring>
 #include "Extension/Music/local_music_ui.h"
 #include "local_music_assets.h"
+#include "local_music_playback.h"
 #include "music_artwork.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
@@ -473,6 +474,20 @@ bool read_music_catalog(MusicCatalog& result) {
             row.artwork = found->second;
         snapshot.playlists.push_back(std::move(row));
     }
+    std::vector<music_preference::Playlist> remembered;
+    for (const auto& playlist : snapshot.playlists) {
+        if (spotify_station::is_station(playlist.id) || playlist.id.starts_with(external_audio::playlist_prefix) ||
+            playlist.id.starts_with(youtube_music::playlist_prefix) || playlist.id.starts_with(youtube_music::files_prefix) ||
+            playlist.id.starts_with(youtube_music::radio_prefix)) continue;
+        music_preference::Playlist entry{playlist.id, {}};
+        for (const auto& song : playlist.songs) {
+            const auto found = identities.find(song);
+            if (found == identities.end()) { entry.members.clear(); break; }
+            entry.members.push_back(found->second);
+        }
+        if (!entry.members.empty()) remembered.push_back(std::move(entry));
+    }
+    publish_music_preferences(std::move(remembered));
     result = std::move(snapshot);
     return true;
 }

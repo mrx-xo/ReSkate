@@ -30,6 +30,8 @@ std::atomic<std::uint64_t> last_said{~0ull};
 std::atomic<bool> skip{};
 // The channel last bound to a playlist that is no station, and when.
 std::atomic<std::uint32_t> plain_channel{no_channel};
+std::mutex plain_mutex;
+std::uint32_t followed_channel{no_channel}; // Protected together with queue observations.
 std::atomic<std::uint64_t> plain_at{};
 void left_at_store() noexcept;
 // The music player's queue, as last seen choosing a song while a station is on, how it was
@@ -219,10 +221,13 @@ void bound(std::uint32_t channel, bool music_channel, std::uint32_t playlist, st
     }
     const auto before = station_channel.load(std::memory_order_relaxed);
     if (station < 0) {
+        std::lock_guard lock(plain_mutex);
         // A queue is made anew when its channel is bound again (see song_chosen).
-        plain_channel.store(channel, std::memory_order_relaxed);
-        plain_queue.store(0, std::memory_order_relaxed);
-        plain_at.store(GetTickCount64(), std::memory_order_relaxed);
+        if (followed_channel == no_channel || followed_channel == channel) {
+            plain_channel.store(channel, std::memory_order_relaxed);
+            plain_queue.store(0, std::memory_order_relaxed);
+            plain_at.store(GetTickCount64(), std::memory_order_relaxed);
+        }
     }
     if (station >= 0 || before == channel) player_queue.store(0, std::memory_order_relaxed);
     if (station >= 0) {
@@ -244,6 +249,12 @@ void bound(std::uint32_t channel, bool music_channel, std::uint32_t playlist, st
 // from 0x43e260, on joining a session with a station on, 2026-10-13). So every song is given
 // its own words back first, and none is remembered: their assets are not the next map's.
 void before_level_transition() noexcept {
+    // Queues belong to the outgoing map even when their old memory still looks readable.
+    {
+        std::lock_guard lock(plain_mutex);
+        plain_queue.store(0, std::memory_order_relaxed);
+        plain_queue_table.store(0, std::memory_order_relaxed);
+    }
     try {
         std::lock_guard lock(mutex);
         restore_locked();
@@ -292,6 +303,7 @@ void refresh_now_playing() noexcept {
     }
 }
 void plain_song_chosen(std::uintptr_t queue, std::uint32_t channel, bool asked) noexcept {
+    std::lock_guard lock(plain_mutex);
     if (channel != plain_channel.load(std::memory_order_relaxed)) return;
     if (std::uintptr_t table{}; memory::peek(queue, table)) {
         plain_queue_table.store(table, std::memory_order_relaxed);
@@ -321,7 +333,9 @@ std::optional<GameSong> game_song() noexcept {
         return std::nullopt;
     }
 }
-bool game_next() noexcept {
+// Kept separate from the RAII lock because MSVC does not allow SEH and C++ unwinding in
+// the same function. All callers hold plain_mutex across checking and requesting.
+static bool game_next_locked() noexcept {
     if (active()) return false;
     const auto queue = plain_queue.load(std::memory_order_relaxed);
     if (!queue) return false;
@@ -340,6 +354,20 @@ bool game_next() noexcept {
         return false;
     }
 }
+void follow_game_channel(std::uint32_t channel) noexcept {
+    std::lock_guard lock(plain_mutex);
+    followed_channel = channel;
+    if (plain_channel.exchange(channel, std::memory_order_relaxed) != channel) {
+        plain_queue.store(0, std::memory_order_relaxed);
+        plain_queue_table.store(0, std::memory_order_relaxed);
+    }
+}
+bool game_next_on(std::uint32_t channel) noexcept {
+    std::lock_guard lock(plain_mutex);
+    if (channel != no_channel && channel != plain_channel.load(std::memory_order_relaxed)) return false;
+    return game_next_locked();
+}
+bool game_next() noexcept { return game_next_on(no_channel); }
 bool active() noexcept { return station_channel.load(std::memory_order_relaxed) != no_channel; }
 std::atomic<bool> screen_open{};
 void set_music_screen(bool open) noexcept { screen_open.store(open, std::memory_order_relaxed); }

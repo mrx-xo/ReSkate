@@ -11,6 +11,13 @@ namespace dingosdk::game::build::v20260929::local_music {
 // through the game's IAT thunks (0x158fd80/0x1590860) by registration (0x43e260,
 // keyed by "artist - title") and unregistration (0x449e70).
 inline constexpr std::uintptr_t asset_manager = 0x71e39a0;
+// Music manager layout used to resolve a saved playlist against freshly registered members.
+inline constexpr std::size_t manager_lock = 0x20;
+inline constexpr std::size_t playlist_buckets = 0xa0, playlist_capacity = 0xa8;
+inline constexpr std::size_t playlist_members_begin = 0x10, playlist_members_end = 0x18;
+inline constexpr std::size_t playlist_next = 0x58;
+inline constexpr std::size_t ui_favorites_playlist = 0x1f8;
+inline constexpr std::size_t playlist_asset_type = 0x70;
 // MusicGraphAsset vtable.
 inline constexpr std::uintptr_t graph_asset_vtable = 0x6204638;
 // Music metadata (artist/title) vtable.

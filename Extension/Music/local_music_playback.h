@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "local_music_preference.h"
 
 namespace dingosdk::profile_runtime {
 using MusicSelectNext = std::int32_t (__fastcall *)(std::uintptr_t queue, std::uintptr_t playlist_asset);
@@ -13,6 +14,10 @@ bool initialize_music_playback(std::uintptr_t base, bool shuffle) noexcept;
 void activate_music_playback() noexcept;
 void deactivate_music_playback() noexcept;
 bool music_playback_available() noexcept;
+// Catalog entries own GUID values only. Native handles are resolved under the manager lock.
+void publish_music_preferences(std::vector<music_preference::Playlist> playlists);
+void update_music_preference();
+void music_preference_before_level_transition(unsigned next) noexcept;
 MusicSelectNext& music_select_next_original() noexcept;
 // The game's read of one song's number for its scorer, kept within the asset's songs.
 using MusicSongScore = void (__fastcall *)(std::uint32_t place, std::uint32_t* out, std::uintptr_t** context);
